@@ -1,0 +1,8 @@
+**/__pycache__/
+__pycache__
+.DS_Store
+errors
+gpu_watchdog.log
+compile_times.txt
+http_service.log
+http_service*.log
