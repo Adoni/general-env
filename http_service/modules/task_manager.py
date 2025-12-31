@@ -61,6 +61,8 @@ class TaskManager:
                 return compile_result
             else:
                 assert compile_result is None
+        else:
+            self.current_compiling_tasks_count -= 1
         # 3. 找到一个空闲的GPU
         logger.info(f"Finding a device")
         try:

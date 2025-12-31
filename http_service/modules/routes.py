@@ -22,7 +22,7 @@ class MonitorValue(BaseModel):
 
 MONITOR_VALUE = MonitorValue(total_requests=0, total_responses=0)
 
-def get_system_usage():
+async def get_system_usage():
     """
     获取系统CPU和内存使用率
     
@@ -35,7 +35,7 @@ def get_system_usage():
     
     # 获取CPU使用率（interval参数指定测量时间间隔）
     # interval=1 表示测量1秒内的平均使用率
-    cpu_percent = psutil.cpu_percent(interval=1)
+    cpu_percent = await asyncio.to_thread(psutil.cpu_percent, interval=1)
     
     return {
         'memory_percent': memory_percent,
@@ -48,11 +48,11 @@ def get_system_usage():
 @router.post("/run_code_replace_benchmark", response_model=CodeRunningTaskStatus)
 async def run_benchmark(task: CodeRunningBenchmarkTask):
     logger.info(f"Get New Code Running Task {task.task_name}")
-    logger.info(f"ONPROCESSING: {MONITOR_VALUE.total_requests-MONITOR_VALUE.total_responses}, TOTAL_REQUESTS: {MONITOR_VALUE.total_requests}, TOTAL_RESPONSES: {MONITOR_VALUE.total_responses}")
-    current_usage = get_system_usage()
+    current_usage = await get_system_usage()
     logger.info(f"Current System Usage: CPU {current_usage['cpu_percent']}%, Memory {current_usage['memory_percent']}% ({current_usage['memory_used_gb']:.2f}GB/{current_usage['memory_total_gb']:.2f}GB)")
 
     current_running_tasks = MONITOR_VALUE.total_requests - MONITOR_VALUE.total_responses
+    logger.info(f"ONPROCESSING: {current_running_tasks}, TOTAL_REQUESTS: {MONITOR_VALUE.total_requests}, TOTAL_RESPONSES: {MONITOR_VALUE.total_responses}")
     start_time = time.time()
     while time.time() - start_time < task.timeout:
         if current_running_tasks >= 400:
@@ -96,7 +96,7 @@ async def health_check():
     total_requests = MONITOR_VALUE.total_requests
     total_responses = MONITOR_VALUE.total_responses
     current_compiling_tasks = GLOBAL_TASK_MANAGER.get_current_compiling_tasks_count()
-    system_usage = get_system_usage()
+    system_usage = await get_system_usage()
     return {
         "status": "ok",
         "timestamp": datetime.now(),
