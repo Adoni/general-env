@@ -102,8 +102,10 @@ async def health_check():
         "timestamp": datetime.now(),
         "total_requests": total_requests,
         "total_responses": total_responses,
+        "current_running_tasks": total_requests - total_responses,
         "current_compiling_tasks": current_compiling_tasks,
+        "current_gpu_tasks": GLOBAL_TASK_MANAGER.get_current_gpu_tasks_count(),
+        "compile_finish_but_not_run_count": GLOBAL_TASK_MANAGER.compile_finish_but_not_run_count,
         "system_usage": system_usage,
     }
 
-print(get_system_usage())

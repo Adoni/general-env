@@ -30,9 +30,13 @@ class TaskManager:
             self.device_queue.put_nowait(f"{i}")
             # assert i != 7, "GPU 7 需要保留给编译使用"
         self.current_compiling_tasks_count = 0
+        self.current_gpu_tasks_count = 0
+        self.compile_finish_but_not_run_count = 0
 
     def get_current_compiling_tasks_count(self) -> int:
         return self.current_compiling_tasks_count
+    def get_current_gpu_tasks_count(self) -> int:
+        return self.current_gpu_tasks_count
 
     async def run_code_running_task(
         self, task: CodeRunningBenchmarkTask
@@ -63,6 +67,7 @@ class TaskManager:
                 assert compile_result is None
         else:
             self.current_compiling_tasks_count -= 1
+        self.compile_finish_but_not_run_count += 1
         # 3. 找到一个空闲的GPU
         logger.info(f"Finding a device")
         try:
@@ -87,18 +92,23 @@ class TaskManager:
 
         # 4. 运行代码
         logger.info(f"Running code running task {task.task_name}")
+        self.current_gpu_tasks_count += 1
+        self.compile_finish_but_not_run_count -= 1
         result = await self.run_to_get_a_new_result_with_error(
             task, device_id=device_id, temp_proj_dir=temp_proj_dir, temp_exec_base_dir=temp_exec_base_dir
         )
+        self.current_gpu_tasks_count -= 1
 
         # 5. 释放GPU
-        await asyncio.sleep(10)  # 等待1秒，确保GPU被释放
+        release_start = time.time()
+        await asyncio.sleep(1)  # 等待1秒，确保GPU被释放
         try:
             await self.force_release_gpu(device_id)  # 强制释放GPU
         except Exception as e:
             logger.error(f"Failed to force release GPU {device_id}: {str(e)}")
         self.device_queue.put_nowait(device_id)
-        bg_green(f"Task finished. Release device {device_id} now!")
+        release_end = time.time()
+        bg_green(f"Task finished. Release device {device_id} now! Time taken: {release_end - release_start:.2f} seconds")
         return result
 
     async def run_compile_command_adopt_error(self, task: CodeRunningBenchmarkTask, temp_proj_dir: Path) -> tuple[bool, Optional[CodeRunningTaskStatus]]:
