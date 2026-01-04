@@ -12,6 +12,7 @@ from typing import Optional
 
 from colorist import bg_green, bg_red
 from loguru import logger
+import redis
 
 from .basic_models import CodeRunningBenchmarkTask, CodeRunningTaskStatus
 from .cuda_utils import check_gpu_available
@@ -22,16 +23,22 @@ MACHINE = os.environ["MACHINE"]
 bg_red(f'TORCH_CUDA_ARCH_LIST={TORCH_CUDA_ARCH_LIST}, MACHINE={MACHINE}')
 
 
+def clean_redis():
+    r = redis.Redis(host='localhost', port=6379, db=0)
+    r.delete(f"reval_configs")
+
+
+def add_task_to_redis(config: str):
+    r = redis.Redis(host='localhost', port=6379, db=0)
+    r.rpush("eval_configs", config)
+
+
 class TaskManager:
     def __init__(self):
-        gpu_id_list = list(range(0, 8))
-        self.device_queue = asyncio.Queue(maxsize=len(gpu_id_list))
-        for i in gpu_id_list:
-            self.device_queue.put_nowait(f"{i}")
-            # assert i != 7, "GPU 7 需要保留给编译使用"
         self.current_compiling_tasks_count = 0
         self.current_gpu_tasks_count = 0
         self.compile_finish_but_not_run_count = 0
+        clean_redis()
 
     def get_current_compiling_tasks_count(self) -> int:
         return self.current_compiling_tasks_count
@@ -68,47 +75,17 @@ class TaskManager:
         else:
             self.current_compiling_tasks_count -= 1
         self.compile_finish_but_not_run_count += 1
-        # 3. 找到一个空闲的GPU
-        logger.info(f"Finding a device")
-        try:
-            device_id = await asyncio.wait_for(self.device_queue.get(), timeout=task.timeout)
-        except asyncio.TimeoutError:
-            bg_red(f"Failed to find a device for task {task.task_name}")
-            return CodeRunningTaskStatus(
-                task_id=task.task_id,
-                start_time=start_time,
-                end_time=datetime.now(),
-                status="failed",
-                exec_time_seconds=(int((datetime.now() - start_time).total_seconds())),
-                exec_time_human_readable=str(datetime.now() - start_time).split(".")[0],
-                result={},
-                other_logs="Timeout when waiting for a free device",
-                docker_logs="",
-                machine=MACHINE,
-            )
-        logger.info(f"found a device: {device_id}")
-        assert check_gpu_available(device_id), f"Device {device_id} is not empty"
-        bg_green(f"Device {device_id} is empty. Occupy it now!")
 
-        # 4. 运行代码
+        # 3. 构建config
+        config = {"mnk": "1024_1024_1024", "bm": -1, "bn": -1, "bk": -1, "base_dir": "/mgfs/shared/Group_GY/wenchao/e-hgemm-32/results"}
+
+        # 4. 放入
         logger.info(f"Running code running task {task.task_name}")
-        self.current_gpu_tasks_count += 1
-        self.compile_finish_but_not_run_count -= 1
-        result = await self.run_to_get_a_new_result_with_error(
-            task, device_id=device_id, temp_proj_dir=temp_proj_dir, temp_exec_base_dir=temp_exec_base_dir
-        )
+        result = await self.run_to_get_a_new_result_with_error(task, temp_exec_base_dir=temp_exec_base_dir)
         self.current_gpu_tasks_count -= 1
 
         # 5. 释放GPU
-        release_start = time.time()
-        await asyncio.sleep(1)  # 等待1秒，确保GPU被释放
-        try:
-            await self.force_release_gpu(device_id)  # 强制释放GPU
-        except Exception as e:
-            logger.error(f"Failed to force release GPU {device_id}: {str(e)}")
-        self.device_queue.put_nowait(device_id)
-        release_end = time.time()
-        bg_green(f"Task finished. Release device {device_id} now! Time taken: {release_end - release_start:.2f} seconds")
+        bg_green(f"Task finished.")
         return result
 
     async def run_compile_command_adopt_error(self, task: CodeRunningBenchmarkTask, temp_proj_dir: Path) -> tuple[bool, Optional[CodeRunningTaskStatus]]:
@@ -201,10 +178,10 @@ class TaskManager:
             return False, f"Compile command failed with return code {progress.returncode}\n Logs:\n{output}"
         return True, output
 
-    async def run_to_get_a_new_result_with_error(self, task: CodeRunningBenchmarkTask, device_id: str, temp_proj_dir: Path, temp_exec_base_dir: Path) -> CodeRunningTaskStatus:
+    async def run_to_get_a_new_result_with_error(self, task: CodeRunningBenchmarkTask, temp_exec_base_dir: Path) -> CodeRunningTaskStatus:
         start_time = datetime.now()
         try:
-            result = await self.run_to_get_a_new_result(task, device_id, temp_proj_dir, temp_exec_base_dir)
+            result = await self.run_to_get_a_new_result(task, temp_exec_base_dir)
         except Exception as e:
             stack = traceback.format_exc()
             result = CodeRunningTaskStatus(
@@ -234,62 +211,54 @@ class TaskManager:
             logger.info(f"status: {result.status}")
         return result
 
-    async def run_to_get_a_new_result(self, task: CodeRunningBenchmarkTask, device_id: int, temp_proj_dir: Path, temp_exec_base_dir: Path) -> CodeRunningTaskStatus:
+    async def run_to_get_a_new_result(self, task: CodeRunningBenchmarkTask, temp_exec_base_dir: Path) -> CodeRunningTaskStatus:
         # 获取设备ID
         start_time = datetime.now()
-        task.run_command += f" --gpu_device_id {device_id} --base_dir {str(temp_exec_base_dir)}"
-        commands = [
-            f"cd {temp_proj_dir}",
-            task.run_command
-        ]
-        progress = await asyncio.create_subprocess_shell(
-            " && ".join(commands),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT  # 将stderr重定向到stdout
-        )
-        try:
-            stdout, _ = await asyncio.wait_for(progress.communicate(), timeout=task.timeout)
-        except asyncio.TimeoutError:
-            progress.kill()
-            await asyncio.wait_for(progress.communicate(), timeout=60)
-            return CodeRunningTaskStatus(
-                task_id=task.task_id,
-                start_time=start_time,
-                end_time=datetime.now(),
-                status="failed",
-                exec_time_seconds=int((datetime.now() - start_time).total_seconds()),
-                exec_time_human_readable=str(timedelta(seconds=int((datetime.now() - start_time).total_seconds()))),
-                result={},
-                other_logs="Code running command timed out",
-                docker_logs="",
-                machine=MACHINE,
-            )
-        except Exception as e:
-            progress.kill()
-            await asyncio.wait_for(progress.communicate(), timeout=60)
-            return CodeRunningTaskStatus(
-                task_id=task.task_id,
-                start_time=start_time,
-                end_time=datetime.now(),
-                status="failed",
-                exec_time_seconds=int((datetime.now() - start_time).total_seconds()),
-                exec_time_human_readable=str(timedelta(seconds=int((datetime.now() - start_time).total_seconds()))),
-                result={},
-                other_logs=f"Code running command failed when communicating: {str(e)}",
-                docker_logs="",
-                machine=MACHINE,
-            )
-        logs = stdout.decode("utf-8")
+        task.run_command += f" --base_dir {str(temp_exec_base_dir)}"
+        add_task_to_redis(task.run_command)
+        finish_file = temp_exec_base_dir / "finished.txt"
+        error_file = temp_exec_base_dir / "error.txt"
+        start_file = temp_exec_base_dir / "start.txt"
+        real_start_time = -1
+        while 1:
+            await asyncio.sleep(1)
+            if start_file.exists() and real_start_time == -1:
+                real_start_time = time.time()
+                self.current_gpu_tasks_count += 1
+                self.compile_finish_but_not_run_count -= 1
+            if finish_file.exists():
+                break
+            if error_file.exists():
+                break
+            if real_start_time > -1 and time.time() - real_start_time > 120:
+                logger.error(f"Code running command timed out for task {task.task_name}, time={time.time() - real_start_time}")
+                return CodeRunningTaskStatus(
+                    task_id=task.task_id,
+                    start_time=start_time,
+                    end_time=datetime.now(),
+                    status="failed",
+                    exec_time_seconds=int((datetime.now() - start_time).total_seconds()),
+                    exec_time_human_readable=str(timedelta(seconds=int((datetime.now() - start_time).total_seconds()))),
+                    result={},
+                    other_logs="Code running command timed out",
+                    docker_logs="",
+                    machine=MACHINE,
+                )
 
         exec_result = {}
-        if progress.returncode != 0:
-            status = "failed"
-        else:
+        if finish_file.exists():
             status = "success"
             for filename in task.result_filename_list:
                 with open(temp_exec_base_dir / filename, "r") as f:
                     exec_result[filename] = f.read()
-        
+            error_logs = ""
+        else:
+            status = "failed"
+            if error_file.exists():
+                with open(error_file, "r") as f:
+                    error_logs = f.read()
+            else:
+                error_logs = "Unknown error"
         result = CodeRunningTaskStatus(
             task_id=task.task_id,
             start_time=start_time,
@@ -298,7 +267,7 @@ class TaskManager:
             exec_time_seconds=int((datetime.now() - start_time).total_seconds()),
             exec_time_human_readable=str(timedelta(seconds=int((datetime.now() - start_time).total_seconds()))),
             result=exec_result,
-            docker_logs=str(logs),
+            docker_logs=str(error_logs),
             other_logs="",
             machine=MACHINE,
         )
@@ -327,53 +296,5 @@ class TaskManager:
         temp_exec_base_dir.mkdir(parents=True, exist_ok=True)
         return temp_proj_dir, temp_exec_base_dir
     
-    async def force_release_gpu(self, device_id: str):
-        """使用nvidia-smi异步强制释放GPU"""
-        # 异步获取指定GPU上的进程PID
-        proc = await asyncio.create_subprocess_exec(
-            'nvidia-smi', 
-            f'--id={device_id}',
-            '--query-compute-apps=pid',
-            '--format=csv,noheader',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        
-        if proc.returncode != 0:
-            raise Exception(f"nvidia-smi执行失败: {stderr.decode()}")
-        
-        # 解析PID列表
-        pids = [pid.strip() for pid in stdout.decode().split('\n') if pid.strip()]
-        
-        # 并发终止所有进程
-        tasks = []
-        for pid in pids:
-            task = asyncio.create_subprocess_exec(
-                'kill', '-9', pid,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            tasks.append(task)
-        
-        # 等待所有终止操作完成
-        processes = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        killed_pids = []
-        for i, proc in enumerate(processes):
-            if isinstance(proc, Exception):
-                print(f"终止进程 {pids[i]} 失败: {proc}")
-            else:
-                await proc.communicate()
-                if proc.returncode == 0:
-                    killed_pids.append(pids[i])
-                    print(f"已终止进程 PID: {pids[i]}")
-                else:
-                    print(f"终止进程 {pids[i]} 失败，返回码: {proc.returncode}")
-        return {
-            "success": True,
-            "device_id": device_id,
-            "killed_processes": killed_pids
-        }
             
 GLOBAL_TASK_MANAGER = TaskManager()
