@@ -10,9 +10,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+import redis
 from colorist import bg_green, bg_red
 from loguru import logger
-import redis
 
 from .basic_models import CodeRunningBenchmarkTask, CodeRunningTaskStatus
 from .cuda_utils import check_gpu_available
@@ -85,7 +85,6 @@ class TaskManager:
         # 4. 放入
         logger.info(f"Running code running task {task.task_name}")
         result = await self.run_to_get_a_new_result_with_error(task, temp_exec_base_dir=temp_exec_base_dir)
-        self.current_gpu_tasks_count -= 1
 
         # 5. 释放GPU
         bg_green(f"Task finished.")
@@ -187,6 +186,8 @@ class TaskManager:
             result = await self.run_to_get_a_new_result(task, temp_exec_base_dir)
         except Exception as e:
             stack = traceback.format_exc()
+            logger.error(f"Fail to run code running task {task.task_name}")
+            print(str(stack))
             result = CodeRunningTaskStatus(
                 task_id=task.task_id,
                 start_time=start_time,
@@ -226,14 +227,17 @@ class TaskManager:
         while 1:
             await asyncio.sleep(1)
             if start_file.exists() and real_start_time == -1:
+                print(f"Real start on {temp_exec_base_dir}")
                 real_start_time = time.time()
                 self.current_gpu_tasks_count += 1
                 self.compile_finish_but_not_run_count -= 1
             if finish_file.exists():
+                self.current_gpu_tasks_count -= 1
                 break
             if error_file.exists():
+                self.current_gpu_tasks_count -= 1
                 break
-            if real_start_time > -1 and time.time() - real_start_time > 120:
+            if real_start_time > -1 and time.time() - real_start_time > 40:
                 logger.error(f"Code running command timed out for task {task.task_name}, time={time.time() - real_start_time}")
                 return CodeRunningTaskStatus(
                     task_id=task.task_id,
