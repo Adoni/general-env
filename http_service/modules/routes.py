@@ -55,7 +55,8 @@ async def run_benchmark(task: CodeRunningBenchmarkTask):
     logger.info(f"ONPROCESSING: {current_running_tasks}, TOTAL_REQUESTS: {MONITOR_VALUE.total_requests}, TOTAL_RESPONSES: {MONITOR_VALUE.total_responses}")
     start_time = time.time()
     while time.time() - start_time < task.timeout:
-        if current_running_tasks >= 400:
+        current_running_tasks = MONITOR_VALUE.total_requests - MONITOR_VALUE.total_responses
+        if current_running_tasks >= 4000:
             logger.warning(f"Too many concurrent tasks ({current_running_tasks}), rejecting new task {task.task_name}")
             await asyncio.sleep(10)
             # raise HTTPException(status_code=429, detail="Too many concurrent tasks, please try again later.")

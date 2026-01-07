@@ -33,6 +33,9 @@ def add_task_to_redis(config: str):
     r.rpush("eval_configs", config)
 
 
+clean_redis()
+
+
 class TaskManager:
     def __init__(self):
         self.current_compiling_tasks_count = 0
